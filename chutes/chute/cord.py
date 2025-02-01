@@ -421,7 +421,6 @@ class Cord:
             else:
                 args = []
                 kwargs = {"json": request.state.decrypted}
-
         if not self._passthrough:
             if self.input_models and all([isinstance(args[idx], dict) for idx in range(len(args))]):
                 try:

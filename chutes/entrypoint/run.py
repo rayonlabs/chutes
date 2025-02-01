@@ -127,7 +127,7 @@ class GraValMiddleware(BaseHTTPMiddleware):
         """
         Transparently handle decryption and verification.
         """
-        if request.client.host == "127.0.0.1" and False:
+        if request.client.host == "127.0.0.1":
             return await call_next(request)
 
         # Internal endpoints.
@@ -248,20 +248,30 @@ class GraValMiddleware(BaseHTTPMiddleware):
 
         # Decrypt using the symmetric key we exchanged via GraVal.
         if request.method in ("POST", "PUT", "PATCH"):
-            iv = bytes.fromhex(body_bytes[:32].decode())
-            cipher = Cipher(
-                algorithms.AES(self.symmetric_key),
-                modes.CBC(iv),
-                backend=default_backend(),
-            )
-            unpadder = padding.PKCS7(128).unpadder()
-            decryptor = cipher.decryptor()
-            decrypted_data = (
-                decryptor.update(base64.b64decode(body_bytes[32:])) + decryptor.finalize()
-            )
-            unpadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
-            request.state.decrypted = json.loads(unpadded_data)
-            request.state.iv = iv
+            try:
+                iv = bytes.fromhex(body_bytes[:32].decode())
+                cipher = Cipher(
+                    algorithms.AES(self.symmetric_key),
+                    modes.CBC(iv),
+                    backend=default_backend(),
+                )
+                unpadder = padding.PKCS7(128).unpadder()
+                decryptor = cipher.decryptor()
+                decrypted_data = (
+                    decryptor.update(base64.b64decode(body_bytes[32:])) + decryptor.finalize()
+                )
+                unpadded_data = (
+                    (unpadder.update(decrypted_data) + unpadder.finalize())
+                    .rstrip(bytes(range(1, 17)))
+                    .decode()
+                )
+                request.state.decrypted = json.loads(unpadded_data)
+                request.state.iv = iv
+            except ValueError as exc:
+                return ORJSONResponse(
+                    status_code=status.HTTP_451_UNAVAILABLE_FOR_LEGAL_REASONS,
+                    content={"detail": f"Decryption failed: {exc}"},
+                )
 
             def _encrypt(plaintext: bytes):
                 if isinstance(plaintext, str):
@@ -397,7 +407,8 @@ def run_chute(
         logger.info("Added device challenge endpoint: /_device_challenge")
 
         # Filesystem challenge endpoint.
-        async def _fs_challenge(request: Request, challenge: FSChallenge):
+        async def _fs_challenge(request: Request):
+            challenge = FSChallenge(**request.state.decrypted)
             return Response(
                 content=miner().process_filesystem_challenge(
                     filename=challenge.filename,

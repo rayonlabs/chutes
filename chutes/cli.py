@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 
+import os
+import sys
+import glob
 import typer
+from loguru import logger
+from pathlib import Path
 from chutes.entrypoint.api_key import create_api_key
 from chutes.entrypoint.deploy import deploy_chute
 from chutes.entrypoint.register import register
@@ -13,6 +18,17 @@ from chutes.crud import chutes_app, images_app, api_keys_app
 
 app = typer.Typer(no_args_is_help=True)
 
+# Inject the logging intercept library.
+if len(sys.argv) > 1 and sys.argv[1] == "run" and "CHUTE_LD_PRELOAD_INJECTED" not in os.environ:
+    logger_lib = Path(__file__).parent / "chutes-logintercept.so"
+    if os.path.exists(logger_lib):
+        env = os.environ.copy()
+        env["LD_PRELOAD"] = logger_lib
+        env["CHUTE_LD_PRELOAD_INJECTED"] = "1"
+        [os.remove(f) for f in glob.glob("/tmp/_chute*log*")]
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+    else:
+        logger.warning("Chutes log intercept lib not found, proceeding with standard logging")
 
 app.command(name="register", help="Create an account with the chutes run platform!")(register)
 app.command(

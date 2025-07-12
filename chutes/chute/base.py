@@ -13,12 +13,6 @@ from chutes.image import Image
 from chutes.util.context import is_remote
 from chutes.chute.node_selector import NodeSelector
 
-# NOTE: Alternative is to combine the modules
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from chutes.chute.cord import Cord
-
 if os.getenv("CHUTES_EXECUTION_CONTEXT") == "REMOTE":
     existing = os.getenv("NO_PROXY")
     os.environ["NO_PROXY"] = ",".join(
@@ -47,6 +41,9 @@ class Chute(FastAPI):
         concurrency: int = 1,
         **kwargs,
     ):
+        from chutes.chute.cord import Cord
+        from chutes.chute.job import Job
+
         super().__init__(**kwargs)
         self._username = username
         self._name = name
@@ -59,6 +56,7 @@ class Chute(FastAPI):
         self._startup_hooks = []
         self._shutdown_hooks = []
         self._cords: list[Cord] = []
+        self._jobs: list[Job] = []
         self.concurrency = concurrency
         self.docs_url = None
         self.redoc_url = None
@@ -86,6 +84,10 @@ class Chute(FastAPI):
     @property
     def cords(self):
         return self._cords
+
+    @property
+    def jobs(self):
+        return self._jobs
 
     @property
     def node_selector(self):
@@ -151,6 +153,10 @@ class Chute(FastAPI):
             logger.debug(f"  {cord.output_content_type=}")
             logger.debug(f"  {cord.output_schema=}")
 
+        # Job methods.
+        for job in self._jobs:
+            logger.info(f"Found job definition: {job._func.__name__}")
+
     def cord(self, **kwargs):
         """
         Decorator to define a parachute cord (function).
@@ -160,6 +166,16 @@ class Chute(FastAPI):
         cord = Cord(self, **kwargs)
         self._cords.append(cord)
         return cord
+
+    def job(self, **kwargs):
+        """
+        Decorator to define a job.
+        """
+        from chutes.chute.job import Job
+
+        job = Job(self, **kwargs)
+        self._jobs.append(job)
+        return job
 
 
 # For returning things from the templates, aside from just a chute.

@@ -148,7 +148,7 @@ async def _build_remote(image, wait=None, public: bool = False, logo_id: str = N
         form_data.add_field("dockerfile", str(image))
         form_data.add_field("public", str(public))
         form_data.add_field("logo_id", str(logo_id) if logo_id else "__none__")
-        form_data.add_field("wait", str(wait))
+        form_data.add_field("wait", "False")  # unused now
         form_data.add_field("image", base64.b64encode(pickle.dumps(image)).decode())
         with open(os.path.join(build_directory, "chute.zip"), "rb") as infile:
             form_data.add_field(
@@ -176,23 +176,6 @@ async def _build_remote(image, wait=None, public: bool = False, logo_id: str = N
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=None),
             ) as response:
-                # When the client waits for the image, we just stream the logs.
-                if wait:
-                    async for data_enc in response.content:
-                        data = data_enc.decode()
-                        if not data or not data.strip():
-                            continue
-                        if data.startswith("data: {"):
-                            data = json.loads(data[6:])
-                            log_method = (
-                                logger.info if data["log_type"] == "stdout" else logger.warning
-                            )
-                            log_method(data["log"].strip())
-                        elif data.startswith("DONE"):
-                            break
-                        else:
-                            logger.error(data)
-                    return
                 if response.status == 409:
                     logger.error(
                         f"Image with name={image.name} and tag={image.tag} already exists!"
@@ -206,6 +189,56 @@ async def _build_remote(image, wait=None, public: bool = False, logo_id: str = N
                     logger.info(
                         f"Uploaded image package: image_id={data['image_id']}, build will run async"
                     )
+
+                    # Log streaming.
+                    image_id = data["image_id"]
+                    if wait:
+                        await asyncio.sleep(5)
+                        params = {}
+                        attempt = 0
+                        while attempt <= 10:
+                            try:
+                                headers, _ = sign_request(purpose="images")
+                                async with session.get(
+                                    f"/images/{image_id}/logs", params=params, headers=headers
+                                ) as log_resp:
+                                    # If we have a text/plain response, the image build is done and full logs are available.
+                                    content_type = log_resp.headers.get("Content-Type", "")
+                                    if "text/plain" in content_type:
+                                        print(await log_resp.text())
+                                        return
+
+                                    # Error handling.
+                                    if log_resp.status != 200:
+                                        logger.error(
+                                            f"Error streaming build logs: {await log_resp.text()}"
+                                        )
+                                        return
+
+                                    # Stream the logs.
+                                    async for data_enc in log_resp.content:
+                                        data = data_enc.decode()
+                                        if not data or not data.strip():
+                                            continue
+                                        if data.startswith("data: {"):
+                                            data = json.loads(data[6:])
+                                            log_data = data["log"]
+                                            log_method = logger.info
+                                            log_text = f"{log_data}"
+                                            if isinstance(log_data, dict):
+                                                if log_data.get("log_type") != "stdout":
+                                                    log_method = logger.warning
+                                                log_text = log_data.get("log", f"{log_data}")
+                                            log_method(log_text.strip())
+                                            params["offset"] = data["offset"]
+                                        elif data.startswith("DONE"):
+                                            return
+                                    return
+                            except Exception as exc:
+                                logger.error(f"Error streaming logs, retrying...: {exc}")
+                                await asyncio.sleep(1)
+                                attempt += 1
+                            await asyncio.sleep(5)
 
 
 async def _image_exists(image: str | Image) -> bool:

@@ -58,7 +58,24 @@ async def _deploy(
             }
             for cord in chute._cords
         ],
+        "jobs": [
+            {
+                "ports": [
+                    {
+                        "name": port.name,
+                        "port": port.port,
+                        "proto": port.proto,
+                    }
+                    for port in job.ports
+                ],
+                "timeout": job.timeout,
+                "name": job._name,
+                "upload": job.upload,
+            }
+            for job in chute._jobs
+        ],
     }
+
     headers, request_string = sign_request(request_body)
     async with aiohttp.ClientSession(base_url=config.generic.api_base_url) as session:
         async with session.post(

@@ -3,21 +3,22 @@ Run a chute, automatically handling encryption/decryption via GraVal.
 """
 
 import os
+import re
 import asyncio
+import aiohttp
 import sys
+import jwt
 import time
 import uuid
-import hashlib
 import inspect
 import typer
 import psutil
 import base64
-import aiohttp
+import secrets
 import orjson as json
 from loguru import logger
 from typing import Optional, Any
 from datetime import datetime
-from functools import lru_cache
 from pydantic import BaseModel
 from ipaddress import ip_address
 from uvicorn import Config, Server
@@ -26,10 +27,10 @@ from fastapi.responses import ORJSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from substrateinterface import Keypair, KeypairType
-from chutes.entrypoint._shared import load_chute
-from chutes.chute import ChutePack
+from chutes.entrypoint._shared import load_chute, miner, authenticate_request
+from chutes.entrypoint.ssh import setup_ssh_access
+from chutes.chute import ChutePack, Job
 from chutes.util.context import is_local
-import chutes.envdump as envdump
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
@@ -82,6 +83,84 @@ def get_env_dump(request: Request):
     )
 
 
+async def get_metrics():
+    """
+    Get the latest prometheus metrics.
+    """
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+async def get_devices():
+    """
+    Fetch device information.
+    """
+    return [miner().get_device_info(idx) for idx in range(miner()._device_count)]
+
+
+async def process_device_challenge(request: Request, challenge: str):
+    """
+    Process a GraVal device info challenge string.
+    """
+    return Response(
+        content=miner().process_device_info_challenge(challenge),
+        media_type="text/plain",
+    )
+
+
+async def process_fs_challenge(request: Request):
+    """
+    Process a filesystem challenge.
+    """
+    challenge = FSChallenge(**request.state.decrypted)
+    return Response(
+        content=miner().process_filesystem_challenge(
+            filename=challenge.filename,
+            offset=challenge.offset,
+            length=challenge.length,
+        ),
+        media_type="text/plain",
+    )
+
+
+async def handle_slurp(request: Request, chute_module):
+    """
+    Read part or all of a file.
+    """
+    slurp = Slurp(**request.state.decrypted)
+    if slurp.path == "__file__":
+        source_code = inspect.getsource(chute_module)
+        return Response(
+            content=base64.b64encode(source_code.encode()).decode(),
+            media_type="text/plain",
+        )
+    elif slurp.path == "__run__":
+        source_code = inspect.getsource(sys.modules[__name__])
+        return Response(
+            content=base64.b64encode(source_code.encode()).decode(),
+            media_type="text/plain",
+        )
+    if not os.path.isfile(slurp.path):
+        if os.path.isdir(slurp.path):
+            if hasattr(request.state, "_encrypt"):
+                return {"json": request.state._encrypt(json.dumps({"dir": os.listdir(slurp.path)}))}
+            return {"dir": os.listdir(slurp.path)}
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Path not found: {slurp.path}",
+        )
+    response_bytes = None
+    with open(slurp.path, "rb") as f:
+        f.seek(slurp.start_byte)
+        if slurp.end_byte is None:
+            response_bytes = f.read()
+        else:
+            response_bytes = f.read(slurp.end_byte - slurp.start_byte)
+    response_data = {"contents": base64.b64encode(response_bytes).decode()}
+    if hasattr(request.state, "_encrypt"):
+        return {"json": request.state._encrypt(json.dumps(response_data))}
+    return response_data
+
+
 async def pong(request: Request) -> dict[str, Any]:
     """
     Echo incoming request as a liveness check.
@@ -119,13 +198,6 @@ class Slurp(BaseModel):
     end_byte: Optional[int] = None
 
 
-@lru_cache(maxsize=1)
-def miner():
-    from graval import Miner
-
-    return Miner()
-
-
 class FSChallenge(BaseModel):
     filename: str
     length: int
@@ -144,7 +216,7 @@ class DevMiddleware(BaseHTTPMiddleware):
 
 
 class GraValMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: FastAPI, concurrency: int = 1):
+    def __init__(self, app: FastAPI, concurrency: int = 1, symmetric_key: str = None):
         """
         Initialize a semaphore for concurrency control/limits.
         """
@@ -152,7 +224,7 @@ class GraValMiddleware(BaseHTTPMiddleware):
         self.concurrency = concurrency
         self.lock = asyncio.Lock()
         self.requests_in_flight = {}
-        self.symmetric_key = None
+        self.symmetric_key = symmetric_key
         self.app = app
 
     async def _dispatch(self, request: Request, call_next):
@@ -182,100 +254,10 @@ class GraValMiddleware(BaseHTTPMiddleware):
             else:
                 return await call_next(request)
 
-        # Verify the signature.
-        miner_hotkey = request.headers.get("X-Chutes-Miner")
-        validator_hotkey = request.headers.get("X-Chutes-Validator")
-        nonce = request.headers.get("X-Chutes-Nonce")
-        signature = request.headers.get("X-Chutes-Signature")
-        if (
-            any(not v for v in [miner_hotkey, validator_hotkey, nonce, signature])
-            or validator_hotkey != miner()._validator_ss58
-            or miner_hotkey != miner()._miner_ss58
-            or int(time.time()) - int(nonce) >= 30
-        ):
-            logger.warning(f"Missing auth data: {request.headers}")
-            return ORJSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"detail": "go away (missing)"},
-            )
-        body_bytes = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
-        payload_string = hashlib.sha256(body_bytes).hexdigest() if body_bytes else "chutes"
-        signature_string = ":".join(
-            [
-                miner_hotkey,
-                validator_hotkey,
-                nonce,
-                payload_string,
-            ]
-        )
-        if not miner()._keypair.verify(signature_string, bytes.fromhex(signature)):
-            return ORJSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"detail": "go away (sig)"},
-            )
-
-        # Decrypt the payload.
-        if not self.symmetric_key and path != "/_exchange":
-            logger.warning("Received a request but we need the symmetric key first!")
-            return ORJSONResponse(
-                status_code=status.HTTP_426_UPGRADE_REQUIRED,
-                content={"detail": "Exchange a symmetric key via GraVal first."},
-            )
-        if path == "/_exchange":
-            # Initial GraVal payload that contains the symmetric key, encrypted with GraVal.
-            encrypted_body = json.loads(body_bytes)
-            required_fields = {"ciphertext", "iv", "length", "device_id", "seed"}
-            decrypted_body = {}
-            for key in encrypted_body:
-                if not all(field in encrypted_body[key] for field in required_fields):
-                    logger.error(
-                        f"Missing encryption fields: {required_fields - set(encrypted_body[key])}"
-                    )
-                    return ORJSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content={
-                            "detail": "Missing one or more required fields for encrypted payloads!"
-                        },
-                    )
-                if encrypted_body[key]["seed"] != miner()._seed:
-                    logger.error(
-                        f"Expecting seed: {miner()._seed}, received {encrypted_body[key]['seed']}"
-                    )
-                    return ORJSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content={"detail": "Provided seed does not match initialization seed!"},
-                    )
-
-                try:
-                    # Decrypt the request body.
-                    ciphertext = base64.b64decode(encrypted_body[key]["ciphertext"].encode())
-                    iv = bytes.fromhex(encrypted_body[key]["iv"])
-                    decrypted = miner().decrypt(
-                        ciphertext,
-                        iv,
-                        encrypted_body[key]["length"],
-                        encrypted_body[key]["device_id"],
-                    )
-                    assert decrypted, "Decryption failed!"
-                    decrypted_body[key] = decrypted
-                except Exception as exc:
-                    return ORJSONResponse(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        content={"detail": f"Decryption failed: {exc}"},
-                    )
-
-            # Extract our symmetric key.
-            secret = decrypted_body.get("symmetric_key")
-            if not secret:
-                return ORJSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={"detail": "Exchange request must contain symmetric key!"},
-                )
-            self.symmetric_key = bytes.fromhex(secret)
-            return ORJSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={"ok": True},
-            )
+        # Authentication...
+        body_bytes, failure_response = await authenticate_request(request, miner())
+        if failure_response:
+            return failure_response
 
         # Decrypt using the symmetric key we exchanged via GraVal.
         if request.method in ("POST", "PUT", "PATCH"):
@@ -342,7 +324,6 @@ class GraValMiddleware(BaseHTTPMiddleware):
                     "/_devices",
                     "/_env_sig",
                     "/_env_dump",
-                    "/_exchange",
                     "/_token",
                     "/_dump",
                     "/_sig",
@@ -356,26 +337,25 @@ class GraValMiddleware(BaseHTTPMiddleware):
 
         # Decrypt encrypted paths, which could be one of the above as well.
         path = request.scope.get("path", "")
-        if self.symmetric_key and path != "/_exchange":
-            try:
-                iv = bytes.fromhex(path[1:33])
-                cipher = Cipher(
-                    algorithms.AES(self.symmetric_key),
-                    modes.CBC(iv),
-                    backend=default_backend(),
-                )
-                unpadder = padding.PKCS7(128).unpadder()
-                decryptor = cipher.decryptor()
-                decrypted_data = decryptor.update(bytes.fromhex(path[33:])) + decryptor.finalize()
-                actual_path = unpadder.update(decrypted_data) + unpadder.finalize()
-                actual_path = actual_path.decode().rstrip("?")
-                logger.info(f"Decrypted request path: {actual_path} from input path: {path}")
-                request.scope["path"] = actual_path
-            except ValueError:
-                return ORJSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content={"detail": f"Bad path: {path}"},
-                )
+        try:
+            iv = bytes.fromhex(path[1:33])
+            cipher = Cipher(
+                algorithms.AES(self.symmetric_key),
+                modes.CBC(iv),
+                backend=default_backend(),
+            )
+            unpadder = padding.PKCS7(128).unpadder()
+            decryptor = cipher.decryptor()
+            decrypted_data = decryptor.update(bytes.fromhex(path[33:])) + decryptor.finalize()
+            actual_path = unpadder.update(decrypted_data) + unpadder.finalize()
+            actual_path = actual_path.decode().rstrip("?")
+            logger.info(f"Decrypted request path: {actual_path} from input path: {path}")
+            request.scope["path"] = actual_path
+        except ValueError:
+            return ORJSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"detail": f"Bad path: {path}"},
+            )
 
         # Now pass the decrypted special paths through.
         if request.scope.get("path", "").endswith(
@@ -390,7 +370,6 @@ class GraValMiddleware(BaseHTTPMiddleware):
                 "/_devices",
                 "/_env_sig",
                 "/_env_dump",
-                "/_exchange",
                 "/_token",
                 "/_dump",
                 "/_sig",
@@ -452,153 +431,343 @@ class GraValMiddleware(BaseHTTPMiddleware):
                 self.requests_in_flight.pop(request.request_id, None)
 
 
-# NOTE: Might want to change the name of this to 'start'.
-# So `run` means an easy way to perform inference on a chute (pull the cord :P)
+async def _gather_devices_and_initialize(
+    token: str, host: str, port_mappings: list[dict[str, Any]]
+) -> dict:
+    """
+    Gather the GPU info assigned to this pod, submit with our one-time token to get GraVal seed.
+    """
+    from chutes.envdump import DUMPER
+
+    # Build the GraVal request based on the GPUs that were actually assigned to this pod.
+    logger.info("Collecting GPUs and port mappings...")
+    body = {"gpus": [], "port_mappings": port_mappings, "host": host}
+    for idx in range(miner()._device_count):
+        body["gpus"].append(miner().get_device_info(idx))
+    token_data = jwt.decode(token, options={"verify_signature": False})
+    url = token_data.get("url")
+    key = token_data.get("env_key", "a" * 32)
+
+    logger.info("Collecting full envdump...")
+    body["env"] = DUMPER.dump(key)
+
+    # Fetch the challenges.
+    async with aiohttp.ClientSession(raise_for_status=True) as session:
+        logger.info(f"Collected all environment data, submitting to validator: {url}")
+        async with session.post(url, headers={"Authorization": token}, json=body) as resp:
+            init_params = await resp.json()
+            logger.success(f"Successfully fetched initialization params: {init_params=}")
+
+            # First, we initialize graval on all GPUs from the provided seed.
+            miner()._graval_seed = init_params["seed"]
+            iterations = init_params.get("iterations", 1)
+            logger.info(f"Generating proofs from seed={miner()._graval_seed}")
+            proofs = miner().prove(miner()._graval_seed, iterations=iterations)
+
+            # Run filesystem verification challenge.
+            seed_str = str(init_params["seed"])
+            fsv_hash = None
+            try:
+                logger.info(f"Running filesystem verification challenge with seed={seed_str}")
+                cfsv_path = os.path.join(os.path.dirname(__file__), "..", "cfsv")
+                result = subprocess.run(
+                    ["cfsv", "challenge", "/", seed_str, "full", "/etc/chutesfs.index"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                for line in result.stdout.strip().split('\n'):
+                    if line.startswith("RESULT:"):
+                        fsv_hash = line.split("RESULT:")[1].strip()
+                        logger.success(f"Filesystem verification hash: {fsv_hash}")
+                        break
+                if not fsv_hash:
+                    logger.warning("Failed to extract filesystem verification hash from cfsv output")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"cfsv challenge failed: {e.stderr}")
+            except Exception as e:
+                logger.error(f"Error running cfsv challenge: {e}")
+            if not fsv_hash:
+                raise Exception("Failed to generate filesystem challenge response.")
+
+            # Use GraVal to extract the symmetric key from the challenge.
+            sym_key = init_params["symmetric_key"]
+            bytes_ = base64.b64decode(sym_key["ciphertext"])
+            iv = bytes_[:16]
+            cipher = bytes_[16:]
+            logger.info("Decrypting payload via proof challenge matrix...")
+            symmetric_key = bytes.fromhex(
+                miner().decrypt(
+                    init_params["seed"], cipher, iv, len(cipher), sym_key["device_index"]
+                )
+            )
+
+            # Now, we can respond to the URL by encrypting a payload with the symmetric key and sending it back.
+            padder = padding.PKCS7(128).padder()
+            new_iv = secrets.token_bytes(16)
+            cipher = Cipher(
+                algorithms.AES(symmetric_key),
+                modes.CBC(new_iv),
+                backend=default_backend(),
+            )
+            plaintext = sym_key["response_plaintext"]
+            padded_data = padder.update(plaintext.encode()) + padder.finalize()
+            encryptor = cipher.encryptor()
+            encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+            response_cipher = base64.b64encode(encrypted_data).decode()
+            logger.success(
+                f"Completed PoVW challenge, sending back: {plaintext=} "
+                f"as {response_cipher=} where iv={new_iv.hex()}"
+            )
+
+            # Post the response to the challenge, which returns job data (if any).
+            async with session.put(
+                url,
+                headers={"Authorization": token},
+                json={
+                    "response": response_cipher,
+                    "iv": new_iv.hex(),
+                    "proof": proofs,
+                    "fsv": fsv_hash,
+                },
+            ) as resp:
+                logger.success("Successfully negotiated challenge response!")
+                return symmetric_key, await resp.json()
+
+
+# Run a chute (which can be an async job or otherwise long-running process).
 def run_chute(
     chute_ref_str: str = typer.Argument(
         ..., help="chute to run, in the form [module]:[app_name], similar to uvicorn"
     ),
     miner_ss58: str = typer.Option(None, help="miner hotkey ss58 address"),
     validator_ss58: str = typer.Option(None, help="validator hotkey ss58 address"),
-    port: int | None = typer.Option(None, help="port to listen on"),
-    host: str | None = typer.Option(None, help="host to bind to"),
-    graval_seed: int | None = typer.Option(None, help="graval seed for encryption/decryption"),
+    host: str | None = typer.Option("0.0.0.0", help="host to bind to"),
+    port: int | None = typer.Option(8000, help="port to listen on"),
+    logging_port: int | None = typer.Option(8001, help="logging port"),
+    keyfile: str | None = typer.Option(None, help="path to TLS key file"),
+    certfile: str | None = typer.Option(None, help="path to TLS certificate file"),
     debug: bool = typer.Option(False, help="enable debug logging"),
     dev: bool = typer.Option(False, help="dev/local mode"),
+    dev_job_data_path: str = typer.Option(None, help="dev mode: job payload JSON path"),
+    dev_job_method: str = typer.Option(None, help="dev mode: job method"),
 ):
-    """
-    Run the chute (uvicorn server).
-    """
-
     async def _run_chute():
+        """
+        Run the chute (or job).
+        """
+        # Load the chute.
         chute_module, chute = load_chute(chute_ref_str=chute_ref_str, config_path=None, debug=debug)
         if is_local():
             logger.error("Cannot run chutes in local context!")
             sys.exit(1)
 
-        # Run the server.
         chute = chute.chute if isinstance(chute, ChutePack) else chute
 
-        # GraVal enabled?
-        if dev:
-            chute.add_middleware(DevMiddleware)
-            if graval_seed is not None:
-                logger.info(f"Initializing graval with {graval_seed=}")
-                miner().initialize(graval_seed)
-                miner()._seed = graval_seed
-        else:
-            if graval_seed is not None:
-                logger.info(f"Initializing graval with {graval_seed=}")
-                miner().initialize(graval_seed)
-                miner()._seed = graval_seed
-            chute.add_middleware(GraValMiddleware, concurrency=chute.concurrency)
-            miner()._miner_ss58 = miner_ss58
-            miner()._validator_ss58 = validator_ss58
-            miner()._keypair = Keypair(ss58_address=validator_ss58, crypto_type=KeypairType.SR25519)
+        # Load token and port mappings from the environment.
+        token = os.getenv("CHUTES_LAUNCH_JWT")
+        port_mappings = [
+            # Main chute pod.
+            {
+                "proto": "tcp",
+                "internal_port": port,
+                "external_port": port,
+            },
+            # Logging server.
+            {
+                "proto": "tcp",
+                "internal_port": logging_port,
+                "external_port": logging_port,
+            },
+        ]
+        external_host = os.getenv("CHUTES_EXTERNAL_HOST")
+        primary_port = os.getenv("CHUTES_PORT_PRIMARY")
+        if primary_port and primary_port.isdigit():
+            port_mappings[0]["external_port"] = int(primary_port)
+        ext_logging_port = os.getenv("CHUTES_PORT_LOGGING")
+        if ext_logging_port and ext_logging_port.isdigit():
+            port_mappings[1]["external_port"] = int(ext_logging_port)
+        for key, value in os.environ.items():
+            port_match = re.match(r"^CHUTES_PORT_(TCP|UDP|HTTP)_[0-9]+", key)
+            if port_match and value.isdigit():
+                port_mappings.append(
+                    {
+                        "proto": port_match.group(1),
+                        "internal_port": int(port_match.group(2)),
+                        "external_port": int(value),
+                    }
+                )
 
-        # Run initialization code.
+        # GPU verification plus job fetching.
+        job_data: dict | None = None
+        symmetric_key: str | None = None
+        job_id: str | None = None
+        job_obj: Job | None = None
+        job_method: str | None = None
+        job_status_url: str | None = None
+        if token:
+            symmetric_key, response = await _gather_devices_and_initialize(
+                token, external_host, port_mappings
+            )
+            job_id = response.get("job_id")
+            job_method = response.get("job_method")
+            job_status_url = response.get("job_status_url")
+            if job_method:
+                job_obj = next(j for j in chute._jobs if j.name == job_method)
+            job_data = response.get("job_data")
+
+        elif not dev:
+            logger.error("No GraVal token supplied!")
+            sys.exit(1)
+
+        # Configure dev method job payload/method/etc.
+        if dev and dev_job_data_path:
+            with open(dev_job_data_path) as infile:
+                job_data = json.loads(infile.read())
+            job_id = str(uuid.uuid4())
+            job_method = dev_job_method
+            job_obj = next(j for j in chute._jobs if j.name == dev_job_method)
+            logger.info(f"Creating task, dev mode, for {job_method=}")
+
+        # Run the chute's initialization code.
         await chute.initialize()
 
-        # Metrics endpoint.
-        async def _metrics():
-            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-        chute.add_api_route("/_metrics", _metrics, methods=["GET"])
+        # Encryption/rate-limiting middleware setup.
+        if dev:
+            chute.add_middleware(DevMiddleware)
+        else:
+            chute.add_middleware(
+                GraValMiddleware,
+                concurrency=chute.concurrency,
+                symmetric_key=symmetric_key,
+            )
 
         # Slurps and processes.
-        def handle_slurp(request: Request):
-            """
-            Read part or all of a file.
-            """
+        async def _handle_slurp(request: Request):
             nonlocal chute_module
-            slurp = Slurp(**request.state.decrypted)
-            if slurp.path == "__file__":
-                source_code = inspect.getsource(chute_module)
-                return Response(
-                    content=base64.b64encode(source_code.encode()).decode(),
-                    media_type="text/plain",
-                )
-            elif slurp.path == "__run__":
-                source_code = inspect.getsource(sys.modules[__name__])
-                return Response(
-                    content=base64.b64encode(source_code.encode()).decode(),
-                    media_type="text/plain",
-                )
-            if not os.path.isfile(slurp.path):
-                if os.path.isdir(slurp.path):
-                    if hasattr(request.state, "_encrypt"):
-                        return {
-                            "json": request.state._encrypt(
-                                json.dumps({"dir": os.listdir(slurp.path)})
-                            )
-                        }
-                    return {"dir": os.listdir(slurp.path)}
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Path not found: {slurp.path}",
-                )
-            response_bytes = None
-            with open(slurp.path, "rb") as f:
-                f.seek(slurp.start_byte)
-                if slurp.end_byte is None:
-                    response_bytes = f.read()
-                else:
-                    response_bytes = f.read(slurp.end_byte - slurp.start_byte)
-            response_data = {"contents": base64.b64encode(response_bytes).decode()}
-            if hasattr(request.state, "_encrypt"):
-                return {"json": request.state._encrypt(json.dumps(response_data))}
-            return response_data
 
-        chute.add_api_route("/_slurp", handle_slurp, methods=["POST"])
-        chute.add_api_route("/_procs", get_all_process_info)
+            return await handle_slurp(request, chute_module)
 
-        # Env checks.
-        chute.add_api_route("/_env_sig", get_env_sig, methods=["POST"])
-        chute.add_api_route("/_env_dump", get_env_dump, methods=["POST"])
-
-        # Add a ping endpoint for validators to use.
+        # Validation endpoints.
         chute.add_api_route("/_ping", pong, methods=["POST"])
         chute.add_api_route("/_token", get_token, methods=["POST"])
         chute.add_api_route("/_alive", is_alive, methods=["GET"])
-
-        async def _devices():
-            return [miner().get_device_info(idx) for idx in range(miner()._device_count)]
-
-        chute.add_api_route("/_devices", _devices)
-
-        # Device info challenge endpoint.
-        async def _device_challenge(request: Request, challenge: str):
-            return Response(
-                content=miner().process_device_info_challenge(challenge),
-                media_type="text/plain",
-            )
-
-        chute.add_api_route("/_device_challenge", _device_challenge, methods=["GET"])
-
-        # Filesystem challenge endpoint.
-        async def _fs_challenge(request: Request):
-            challenge = FSChallenge(**request.state.decrypted)
-            return Response(
-                content=miner().process_filesystem_challenge(
-                    filename=challenge.filename,
-                    offset=challenge.offset,
-                    length=challenge.length,
-                ),
-                media_type="text/plain",
-            )
-
-        chute.add_api_route("/_fs_challenge", _fs_challenge, methods=["POST"])
+        chute.add_api_route("/_metrics", get_metrics, methods=["GET"])
+        chute.add_api_route("/_slurp", _handle_slurp, methods=["POST"])
+        chute.add_api_route("/_procs", get_all_process_info, methods=["GET"])
+        chute.add_api_route("/_env_sig", get_env_sig, methods=["POST"])
+        chute.add_api_route("/_env_dump", get_env_dump, methods=["POST"])
+        chute.add_api_route("/_devices", get_devices, methods=["GET"])
+        chute.add_api_route("/_device_challenge", process_device_challenge, methods=["GET"])
+        chute.add_api_route("/_fs_challenge", process_fs_challenge, methods=["POST"])
 
         # New envdump endpoints.
+        import chutes.envdump as envdump
         chute.add_api_route("/_dump", envdump.handle_dump, methods=["POST"])
         chute.add_api_route("/_sig", envdump.handle_sig, methods=["POST"])
         chute.add_api_route("/_toca", envdump.handle_toca, methods=["POST"])
         chute.add_api_route("/_eslurp", envdump.handle_slurp, methods=["POST"])
 
-        logger.info("Added validation endpoints.")
+        logger.success("Added all chutes internal endpoints.")
 
-        config = Config(app=chute, host=host, port=port, limit_concurrency=1000)
+        # Job shutdown/kill endpoint.
+        async def _shutdown():
+            nonlocal job_obj, server
+            if not job_obj:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Job task not found",
+                )
+            logger.warning("Shutdown requested.")
+            if job_obj and not job_obj.cancel_event.is_set():
+                job_obj.cancel_event.set()
+            server.should_exit = True
+            return {"ok": True}
+
+        # Jobs can't be started until the full suite of validation tests run,
+        # so we need to provide an endpoint for the validator to use to kick
+        # it off.
+        if job_id:
+            job_task = None
+
+            async def start_job_with_monitoring(**kwargs):
+                nonlocal job_task
+                ssh_process = None
+                job_task = asyncio.create_task(job_obj.run(job_status_url=job_status_url, **kwargs))
+
+                async def monitor_job():
+                    try:
+                        result = await job_task
+                        logger.info(f"Job completed with result: {result}")
+                    except Exception as e:
+                        logger.error(f"Job failed with error: {e}")
+                    finally:
+                        logger.info("Job finished, shutting down server...")
+                        if ssh_process:
+                            try:
+                                ssh_process.terminate()
+                                await asyncio.sleep(0.5)
+                                if ssh_process.poll() is None:
+                                    ssh_process.kill()
+                                logger.info("SSH server stopped")
+                            except Exception as e:
+                                logger.error(f"Error stopping SSH server: {e}")
+                        server.should_exit = True
+
+                # If the pod defines SSH access, enable it.
+                if job_obj.ssh and job_data.get("_ssh_public_key"):
+                    ssh_process = await setup_ssh_access(job_data["_ssh_public_key"])
+
+                asyncio.create_task(monitor_job())
+
+            await start_job_with_monitoring(**job_data)
+            logger.info("Started job!")
+
+            chute.add_api_route("/_shutdown", _shutdown, methods=["POST"])
+            logger.info("Added shutdown endpoint")
+
+        # Start the uvicorn process, whether in job mode or not.
+        config = Config(
+            app=chute,
+            host=host or "0.0.0.0",
+            port=port or 8000,
+            limit_concurrency=1000,
+            ssl_certfile=certfile,
+            ssl_keyfile=keyfile,
+        )
         server = Server(config)
         await server.serve()
 
-    asyncio.run(_run_chute())
+    # Kick everything off
+    async def _logged_run():
+        """
+        Wrap the actual chute execution with the logging process, which is
+        kept alive briefly after the main process terminates.
+        """
+        from chutes.entrypoint.logger import launch_server
+
+        if not dev:
+            miner()._miner_ss58 = miner_ss58
+            miner()._validator_ss58 = validator_ss58
+            miner()._keypair = Keypair(ss58_address=validator_ss58, crypto_type=KeypairType.SR25519)
+
+        logging_task = asyncio.create_task(
+            launch_server(
+                host=host or "0.0.0.0",
+                port=logging_port,
+                dev=dev,
+                certfile=certfile,
+                keyfile=keyfile,
+            )
+        )
+        try:
+            await _run_chute()
+        finally:
+            await asyncio.sleep(30)
+            logging_task.cancel()
+            try:
+                await logging_task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(_logged_run())

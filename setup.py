@@ -10,7 +10,8 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"))
 # Load version.
 here = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(os.path.join(here, "chutes"))
-import _version
+import _version  # noqa
+
 version = _version.version
 
 setup(
@@ -29,6 +30,8 @@ setup(
             "chutes/pyarmor_runtime_006563/*",
             "chutes/pyarmor_runtime_006563/**/*",
             "chutes/envcheck/*.py",
+            "*.so",
+            "cfsv",
         ],
         "chutes.envdump": ["*.so"],
     },
@@ -46,12 +49,14 @@ setup(
         "substrate-interface>=1.7.11",
         "rich>=13.0.0",
         "typer>=0.12.5",
-        "graval<0.1.0",
+        "graval>=0.1.2",
         "prometheus-client==0.21.0",
         "cryptography",
         "psutil",
+        "pyjwt>=2.10.1",
         "netifaces",
         "pyudev",
+        "aiofiles>=23",
     ],
     extras_require={
         "dev": [
@@ -69,6 +74,7 @@ setup(
     entry_points={
         "console_scripts": [
             "chutes=chutes.cli:app",
+            "cfsv=chutes.cfsv_wrapper:main",
         ],
     },
 )

@@ -100,7 +100,7 @@ def create_api_key(
                         logger.success("API key created successfully")
                         print_json(data=data)
                         print(
-                            f"\nTo use the key, add \"Authorization: Basic {data['secret_key']}\" to your headers!\n"
+                            f'\nTo use the key, add "Authorization: Basic {data["secret_key"]}" to your headers!\n'
                         )
                     else:
                         error_message = await response.text()

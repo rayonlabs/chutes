@@ -1,18 +1,31 @@
 import os
 import re
 import sys
+import time
+import hashlib
 import aiohttp
 import argparse
 import mimetypes
 import importlib
 import importlib.util
 from io import BytesIO
+from functools import lru_cache
 from loguru import logger
 from typing import List, Dict, Any, Tuple
 from chutes.config import get_config
 from chutes.util.auth import sign_request
+from fastapi import Request, status
+from fastapi.responses import ORJSONResponse
+
 
 CHUTE_REF_RE = re.compile(r"^[a-z][a-z0-9_]*:[a-z][a-z0-9_]+$", re.I)
+
+
+@lru_cache(maxsize=1)
+def miner():
+    from graval import Miner
+
+    return Miner()
 
 
 class FakeStreamWriter:
@@ -130,3 +143,40 @@ def load_chute(
         sys.exit(1)
 
     return module, chute
+
+
+async def authenticate_request(request: Request) -> tuple[bytes, ORJSONResponse]:
+    """
+    Request authentication via bittensor hotkey signatures.
+    """
+    miner_hotkey = request.headers.get("X-Chutes-Miner")
+    validator_hotkey = request.headers.get("X-Chutes-Validator")
+    nonce = request.headers.get("X-Chutes-Nonce")
+    signature = request.headers.get("X-Chutes-Signature")
+    if (
+        any(not v for v in [miner_hotkey, validator_hotkey, nonce, signature])
+        or validator_hotkey != miner()._validator_ss58
+        or miner_hotkey != miner()._miner_ss58
+        or int(time.time()) - int(nonce) >= 30
+    ):
+        logger.warning(f"Missing auth data: {request.headers}")
+        return None, ORJSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "go away (missing)"},
+        )
+    body_bytes = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
+    payload_string = hashlib.sha256(body_bytes).hexdigest() if body_bytes else "chutes"
+    signature_string = ":".join(
+        [
+            miner_hotkey,
+            validator_hotkey,
+            nonce,
+            payload_string,
+        ]
+    )
+    if not miner()._keypair.verify(signature_string, bytes.fromhex(signature)):
+        return None, ORJSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "go away (sig)"},
+        )
+    return body_bytes, None
